@@ -1,0 +1,300 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>CricketGPT</title>
+  <style>
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; background:#0b0f19; color:#e6e6e6; }
+    .app { display:flex; height:100vh; }
+    .left { width:320px; border-right:1px solid #1f2a44; padding:16px; box-sizing:border-box; background:#0a1222; }
+    .main { flex:1; display:flex; flex-direction:column; }
+    .header { padding:14px 18px; border-bottom:1px solid #1f2a44; display:flex; align-items:center; gap:10px; }
+    .title { font-weight:700; }
+    .chat { flex:1; overflow:auto; padding:18px; box-sizing:border-box; }
+    .msg { max-width:860px; margin:10px auto; padding:12px 14px; border-radius:14px; line-height:1.35; white-space:pre-wrap; }
+    .user { background:#1b2a4a; }
+    .bot  { background:#111a2e; border:1px solid #1f2a44; }
+    .input { border-top:1px solid #1f2a44; padding:14px 18px; display:flex; gap:10px; }
+    textarea { flex:1; resize:none; height:44px; border-radius:12px; border:1px solid #1f2a44; background:#0a1222; color:#e6e6e6; padding:10px 12px; outline:none; }
+    button { border-radius:12px; border:1px solid #1f2a44; background:#1b2a4a; color:#e6e6e6; padding:10px 14px; cursor:pointer; }
+    button:hover { filter:brightness(1.05); }
+    .hint { font-size:13px; opacity:.85; line-height:1.35; }
+    .row { margin:12px 0; }
+    label { display:block; font-size:13px; opacity:.9; margin-bottom:6px; }
+    input[type="range"] { width:100%; }
+    .small { font-size:12px; opacity:.8; }
+    .pill { display:inline-block; padding:6px 10px; border-radius:999px; border:1px solid #1f2a44; background:#0b0f19; margin:6px 6px 0 0; cursor:pointer; }
+  </style>
+</head>
+<body>
+<div class="app">
+  <div class="left">
+    <div style="font-weight:800; font-size:18px;">CricketGPT</div>
+    <div class="small">Local tiny transformer trained on Cricsheet.</div>
+
+    <div class="row">
+      <label>Temperature: <span id="tempVal">0.7</span></label>
+      <input id="temp" type="range" min="0.2" max="1.2" value="0.7" step="0.05"/>
+    </div>
+
+    <div class="row">
+      <label>Top-K: <span id="topkVal">30</span></label>
+      <input id="topk" type="range" min="0" max="120" value="30" step="5"/>
+      <div class="small">Lower = safer, higher = more variety.</div>
+    </div>
+
+    <div class="row">
+      <label>Prompt ideas</label>
+      <div class="hint">
+        Try:
+        <div class="pill" onclick="fill('Continue this over: Over 16.3: Bumrah to Maxwell,')">Continue this over…</div>
+        <div class="pill" onclick="fill('Summarize the last 3 overs in a hype commentator style.')">Summarize last 3 overs…</div>
+        <div class="pill" onclick="fill('Explain why this wicket was important: Over 14.2: Rashid Khan to Buttler, OUT!')">Explain wicket…</div>
+        <div class="pill" onclick="fill('Generate ball-by-ball commentary for a powerplay over.')">Powerplay commentary…</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <button onclick="clearChat()">Clear chat</button>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="header">
+      <div class="title">Chat</div>
+      <div class="small" id="status">connecting…</div>
+    </div>
+
+    <div id="chat" class="chat"></div>
+
+    <div class="input">
+      <textarea id="box" placeholder="Ask about an over, a wicket, or request commentary…"></textarea>
+      <button onclick="send()">Send</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  const chat = document.getElementById('chat');
+  const box = document.getElementById('box');
+  const statusEl = document.getElementById('status');
+  const temp = document.getElementById('temp');
+  const topk = document.getElementById('topk');
+  const tempVal = document.getElementById('tempVal');
+  const topkVal = document.getElementById('topkVal');
+
+  temp.addEventListener('input', () => tempVal.textContent = temp.value);
+  topk.addEventListener('input', () => topkVal.textContent = topk.value);
+
+  // ---------- “State” ----------
+  let history = [];              // chat bubbles (for UI)
+  let transcriptBalls = [];      // ONLY ball-by-ball lines: "Over X.Y: ..."
+  let matchHeader = "";          // optional: "Match: India vs Australia"
+  const CONTEXT_BALLS = 30;      // how many previous balls to send as context
+  const MAX_NEW_DEFAULT = 140;   // keep a bit smaller to reduce drift
+
+  // ---------- helpers ----------
+  function add(role, text) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + (role === 'user' ? 'user' : 'bot');
+    div.textContent = text;
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  function fill(text){ box.value = text; box.focus(); }
+
+  function clearChat(){
+    history = [];
+    transcriptBalls = [];
+    matchHeader = "";
+    chat.innerHTML = '';
+    add('bot', 'Cleared. Tip: start with a match header like "Match: India vs Australia" then paste a few balls or ask to continue an over.');
+  }
+
+  function isBallLine(line){
+    return /^Over\s+\d+\.\d+:/i.test(line.trim());
+  }
+
+  function extractBallLines(text){
+    // Pull out ONLY lines that look like ball-by-ball
+    const lines = (text || "").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    return lines.filter(isBallLine);
+  }
+
+  function sanitizeModelReply(reply){
+    // Model sometimes returns headers or <|match|> etc. Keep just ball lines when present.
+    const balls = extractBallLines(reply);
+    if (balls.length > 0) return balls.join("\n");
+
+    // If no ball lines, return a short cleaned reply (best-effort)
+    return (reply || "").replace(/<\|match\|>/g, "").trim();
+  }
+
+  function maybeUpdateMatchHeader(userText){
+    // If user types "Match: X vs Y" we store it and confirm
+    const m = userText.match(/^\s*Match:\s*(.+)\s*$/i);
+    if (m && m[1]) {
+      matchHeader = "Match: " + m[1].trim();
+      return true;
+    }
+    return false;
+  }
+
+  function parseOverPrefixFromUser(userText){
+    // Try to find something like "Over 16.3: Bumrah to Maxwell,"
+    const m = userText.match(/(Over\s+\d+\.\d+:\s*[^\n]+)/i);
+    if (!m) return null;
+    return m[1].trim();
+  }
+
+  function buildModelMessage(userText){
+    // We send ONE "message" to backend (it will wrap style tokens in server.py),
+    // but we make sure it contains a strong transcript context.
+
+    // 1) Collect context: last N balls from transcript
+    const ctx = transcriptBalls.slice(-CONTEXT_BALLS);
+
+    // 2) Decide if this is a "forced-prefix" continuation
+    // If user says "Continue..." or "Next ball..." AND includes an Over X.Y prefix,
+    // we force the prompt to end with the exact next ball prefix.
+    const lower = userText.toLowerCase();
+    const wantsContinue = lower.includes("continue") || lower.includes("next ball") || lower.includes("end this over");
+
+    let forced = null;
+    const overPrefix = parseOverPrefixFromUser(userText);
+
+    if (wantsContinue && overPrefix) {
+      // Force by ending with "Over X.Y: ... ,"
+      // Ensure it ends with a comma+space, which your training format expects.
+      forced = overPrefix;
+      if (!forced.endsWith(",")) forced = forced + ",";
+      forced = forced + " ";
+    }
+
+    // 3) Also allow user to paste raw balls; we’ll treat that as transcript update + generation request
+    const pastedBalls = extractBallLines(userText);
+
+    // If user pasted ball lines, add them to context immediately
+    if (pastedBalls.length > 0) {
+      // Update transcript with user-provided balls
+      for (const b of pastedBalls) transcriptBalls.push(b);
+    }
+
+    // 4) Construct the message block.
+    // IMPORTANT: Keep it simple and consistent with training format.
+    // The model has seen:
+    // <|match|>
+    // Match: A vs B
+    // Over ...
+    // Over ...
+    const parts = [];
+    parts.push("<|match|>");
+    if (matchHeader) parts.push(matchHeader);
+
+    // context balls
+    if (ctx.length > 0) parts.push(ctx.join("\n"));
+
+    // If user pasted balls and ALSO wants continuation, we end with forced prefix.
+    // Otherwise we either:
+    // - end with forced prefix (best for continuation)
+    // - or just add userText as a comment line then ask for "Over ..." continuation (weak)
+    if (forced) {
+      parts.push(forced);
+    } else if (pastedBalls.length > 0) {
+      // If they pasted balls but didn't give an explicit forced prefix,
+      // we prompt it to continue from the last known ball by starting the next line:
+      const last = transcriptBalls[transcriptBalls.length - 1];
+      // Try to compute next ball prefix roughly:
+      const m = last.match(/^Over\s+(\d+)\.(\d+):/i);
+      if (m) {
+        const o = parseInt(m[1], 10);
+        const b = parseInt(m[2], 10);
+        // naive increment (works for most; wides/no-balls may exceed .6 but that's fine)
+        const nextB = b + 1;
+        parts.push(`Over ${o}.${nextB}: `);
+      } else {
+        parts.push("Over 0.1: ");
+      }
+    } else {
+      // No forced prefix and no pasted balls => fall back:
+      // Encourage user to provide an Over prefix.
+      parts.push("Instruction: Continue ball-by-ball commentary. Start with an 'Over X.Y:' line.\n");
+      parts.push("User request: " + userText.trim());
+      parts.push("Over 0.1: ");
+    }
+
+    return parts.join("\n");
+  }
+
+  async function health(){
+    try {
+      const r = await fetch('/api/health');
+      const j = await r.json();
+      statusEl.textContent = `ok • ${j.device}`;
+    } catch(e){
+      statusEl.textContent = 'offline';
+    }
+  }
+
+  async function send(){
+    const msg = box.value.trim();
+    if(!msg) return;
+    box.value = '';
+
+    // If user sets match header, just store it and return (no generation)
+    if (maybeUpdateMatchHeader(msg)) {
+      add('user', msg);
+      add('assistant', `Locked match header: ${matchHeader}\nNow paste a few balls or say: "Continue this: Over 16.3: ... ,"`);
+      return;
+    }
+
+    add('user', msg);
+    history.push({role:'user', content: msg});
+
+    // Build a model-focused message with transcript context
+    const modelMsg = buildModelMessage(msg);
+
+    const payload = {
+      message: modelMsg,
+      history: null, // IMPORTANT: don't send chat history to the model; it confuses it
+      temperature: parseFloat(temp.value),
+      top_k: parseInt(topk.value, 10),
+      max_new: MAX_NEW_DEFAULT
+    };
+
+    try{
+      const r = await fetch('/api/chat', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+
+      const j = await r.json();
+      const cleaned = sanitizeModelReply(j.reply);
+
+      add('assistant', cleaned);
+      history.push({role:'assistant', content: cleaned});
+
+      // Update transcript with any ball lines produced
+      const balls = extractBallLines(cleaned);
+      for (const b of balls) transcriptBalls.push(b);
+
+    } catch(e){
+      add('assistant', 'Server error. Is the backend running?');
+    }
+  }
+
+  box.addEventListener('keydown', (e)=>{
+    if(e.key === 'Enter' && !e.shiftKey){
+      e.preventDefault();
+      send();
+    }
+  });
+
+  add('assistant', 'Tip: Set a match header first: "Match: India vs Australia". Then try: "Continue this: Over 16.3: Bumrah to Maxwell,"');
+  health();
+</script>
+</body>
+</html>
